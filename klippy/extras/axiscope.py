@@ -96,6 +96,10 @@ class Axiscope:
             'CALIBRATE_ALL_Z_OFFSETS', self.cmd_CALIBRATE_ALL_Z_OFFSETS,
             desc=self.cmd_CALIBRATE_ALL_Z_OFFSETS_help
         )
+        self.gcode.register_command(
+            'AXISCOPE_CALIBRATE_TOOL_Z', self.cmd_AXISCOPE_CALIBRATE_TOOL_Z,
+            desc=self.cmd_AXISCOPE_CALIBRATE_TOOL_Z_help
+        )
 
         self.gcode.register_command(
             'AXISCOPE_START_GCODE', self.cmd_AXISCOPE_START_GCODE,
@@ -356,6 +360,52 @@ class Axiscope:
 
         return cfg_data
 
+    def update_tool_z_offset(self, cfg_data, tool_name, z_offset):
+        """Update only gcode_z_offset without touching X/Y offsets."""
+        section_name = "[%s]" % tool_name
+        section_start = None
+        section_end = None
+
+        for i, line in enumerate(cfg_data):
+            stripped_line = line.lstrip()
+            if stripped_line.startswith(section_name):
+                section_start = i + 1
+            elif section_start is not None and stripped_line.startswith('['):
+                section_end = i
+                break
+
+        offset_string = "gcode_z_offset: %.3f\n" % z_offset
+
+        if section_start is not None:
+            search_end = section_end if section_end is not None else len(cfg_data)
+            for cfg_index in range(section_start, search_end):
+                stripped_line = cfg_data[cfg_index].lstrip()
+                if stripped_line.startswith('gcode_z_offset'):
+                    cfg_data[cfg_index] = offset_string
+                    return cfg_data
+
+            insert_at = search_end
+            cfg_data.insert(insert_at, offset_string)
+            return cfg_data
+
+        new_section = ["\n", section_name + "\n", offset_string, "\n"]
+
+        no_touch_index = None
+        if self.config_file_path and self.config_file_path.endswith('printer.cfg'):
+            for idx, line in enumerate(cfg_data):
+                if line.lstrip().startswith('#*#'):
+                    no_touch_index = idx
+                    break
+
+        if no_touch_index is not None:
+            return (
+                cfg_data[:no_touch_index]
+                + new_section
+                + cfg_data[no_touch_index:]
+            )
+
+        return cfg_data + new_section
+
     cmd_MOVE_TO_ZSWITCH_help = "Move the toolhead to the Z calibration point"
 
     def cmd_MOVE_TO_ZSWITCH(self, gcmd):
@@ -561,6 +611,90 @@ class Axiscope:
                     'T%s gcode_z_offset: %.3f'
                     % (tool_no, result['z_offset'])
                 )
+
+        self.cmd_AXISCOPE_FINISH_GCODE(gcmd)
+
+    cmd_AXISCOPE_CALIBRATE_TOOL_Z_help = "Calibrate and save the Z offset for one tool"
+
+    def cmd_AXISCOPE_CALIBRATE_TOOL_Z(self, gcmd):
+        if not self.is_homed():
+            gcmd.respond_error('Must home first.')
+            return
+
+        if self.z_backend not in ('switch', 'cartographer'):
+            gcmd.respond_error('Unsupported Z calibration backend.')
+            return
+
+        tool_no = gcmd.get_int('TOOL')
+        if tool_no not in self.toolchanger.tool_numbers:
+            gcmd.respond_error('Tool T%i does not exist.' % tool_no)
+            return
+
+        gcmd.respond_info('=== Axiscope individual Z calibration: T%i ===' % tool_no)
+
+        self.cmd_AXISCOPE_START_GCODE(gcmd)
+
+        # Always establish the configured reference first. This makes an
+        # individual T1/T2/T3 calibration independent of the currently
+        # selected tool and preserves the Cartographer reference workflow.
+        self.cmd_AXISCOPE_BEFORE_PICKUP_GCODE(gcmd)
+        self.gcode.run_script_from_command('T%i' % self.reference_tool)
+        self.cmd_AXISCOPE_AFTER_PICKUP_GCODE(gcmd)
+        self.gcode.run_script_from_command('MOVE_TO_ZSWITCH')
+        self.gcode.run_script_from_command('PROBE_ZSWITCH SAMPLES=%i' % self.samples)
+
+        if tool_no != self.reference_tool:
+            self.cmd_AXISCOPE_BEFORE_PICKUP_GCODE(gcmd)
+            self.gcode.run_script_from_command('T%i' % tool_no)
+            self.cmd_AXISCOPE_AFTER_PICKUP_GCODE(gcmd)
+            self.gcode.run_script_from_command('MOVE_TO_ZSWITCH')
+            self.gcode.run_script_from_command('PROBE_ZSWITCH SAMPLES=%i' % self.samples)
+
+        self.gcode.run_script_from_command('T%i' % self.reference_tool)
+        self.printer.lookup_object('toolhead').wait_moves()
+
+        result = self.probe_results.get(str(tool_no))
+        if result is None:
+            gcmd.respond_error(
+                'No Z calibration result was produced for T%i.' % tool_no
+            )
+            self.cmd_AXISCOPE_FINISH_GCODE(gcmd)
+            return
+
+        suggested_z = result.get('suggested_gcode_z_offset')
+        if suggested_z is None:
+            gcmd.respond_error(
+                'No suggested gcode_z_offset was produced for T%i.' % tool_no
+            )
+            self.cmd_AXISCOPE_FINISH_GCODE(gcmd)
+            return
+
+        if self.has_cfg_data is not False:
+            with open(self.config_file_path, 'r') as f:
+                cfg_data = f.readlines()
+
+            tool_name = self.get_tool_object_name(tool_no)
+            out_data = self.update_tool_z_offset(
+                cfg_data, tool_name, suggested_z
+            )
+
+            with open(self.config_file_path, 'w') as f:
+                for line in out_data:
+                    f.write(line)
+
+            gcmd.respond_info(
+                'T%i gcode_z_offset = %.3f' % (tool_no, suggested_z)
+            )
+            gcmd.respond_info(
+                'T%i Z offset saved to %s' % (tool_no, self.config_file_path)
+            )
+        else:
+            gcmd.respond_info(
+                'T%i gcode_z_offset = %.3f' % (tool_no, suggested_z)
+            )
+            gcmd.respond_info(
+                'WARNING: config_file_path is not configured; offset was NOT saved.'
+            )
 
         self.cmd_AXISCOPE_FINISH_GCODE(gcmd)
 
